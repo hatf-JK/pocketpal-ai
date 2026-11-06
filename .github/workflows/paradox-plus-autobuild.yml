@@ -1,0 +1,147 @@
+name: ParadoxForge PocketPal Plus Auto-Build
+
+on:
+  schedule:
+    # Automatically polls upstream every 12 hours (at 00:30 and 12:30 UTC)
+    - cron: '30 0,12 * * *'
+  workflow_dispatch: # Allows immediate 1-click manual execution from the Actions tab
+
+permissions:
+  contents: write
+
+jobs:
+  check-and-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      TZ: UTC # Enforces UTC timestamps inside APK headers for strict OpSec
+
+    steps:
+      - name: Check Upstream Latest Release vs Fork Releases
+        id: check_release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          UPSTREAM_TAG=$(curl -s https://api.github.com/repos/a-ghorbani/pocketpal-ai/releases/latest | jq -r .tag_name)
+          echo "Detected upstream tag: $UPSTREAM_TAG"
+          if [ -z "$UPSTREAM_TAG" ] || [ "$UPSTREAM_TAG" = "null" ]; then
+            echo "Failed to fetch upstream tag."
+            exit 1
+          fi
+          echo "upstream_tag=$UPSTREAM_TAG" >> $GITHUB_OUTPUT
+
+          if gh release view "$UPSTREAM_TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "Release $UPSTREAM_TAG already exists in fork. Exiting cleanly."
+            echo "should_build=false" >> $GITHUB_OUTPUT
+          else
+            echo "New upstream release $UPSTREAM_TAG detected! Initiating ParadoxForge Plus source build."
+            echo "should_build=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Reclaim Runner Disk Space for Android NDK & CMake Build
+        if: steps.check_release.outputs.should_build == 'true'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android/sdk/system-images /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h
+
+      - name: Checkout Exact Upstream Release Tag
+        if: steps.check_release.outputs.should_build == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: a-ghorbani/pocketpal-ai
+          ref: ${{ steps.check_release.outputs.upstream_tag }}
+          fetch-depth: 1
+
+      - name: Setup Java 17 (Temurin)
+        if: steps.check_release.outputs.should_build == 'true'
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Node.js (from .nvmrc 22.21.0) & Yarn 1.22.22
+        if: steps.check_release.outputs.should_build == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+          cache: 'yarn'
+
+      - name: Install Dependencies & Apply Native Patches (llama.rn / whisper.rn)
+        if: steps.check_release.outputs.should_build == 'true'
+        run: |
+          corepack enable
+          yarn install --frozen-lockfile --check-files
+
+      - name: Satisfy Gradle google-services.json Check (Dummy Local Config)
+        if: steps.check_release.outputs.should_build == 'true'
+        run: |
+          if [ ! -f android/app/google-services.json ]; then
+            cat << 'EOF' > android/app/google-services.json
+          {
+            "project_info": {
+              "project_number": "000000000000",
+              "project_id": "paradox-local-oss",
+              "storage_bucket": "paradox-local-oss.appspot.com"
+            },
+            "client": [
+              {
+                "client_info": {
+                  "mobilesdk_app_id": "1:000000000000:android:0000000000000000",
+                  "android_client_info": { "package_name": "com.pocketpalai" }
+                },
+                "api_key": [{ "current_key": "AIzaSyDummyKeyForParadoxSourceBuild0000" }]
+              }
+            ],
+            "configuration_version": "1"
+          }
+          EOF
+          fi
+
+      - name: Compile Release APK from Source (Plus Entitlement Unlocked)
+        if: steps.check_release.outputs.should_build == 'true'
+        working-directory: ./android
+        env:
+          NODE_ENV: production
+          ORG_GRADLE_PROJECT_reactNativeArchitectures: arm64-v8a
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleProdRelease -PreactNativeArchitectures=arm64-v8a --no-daemon || \
+          ./gradlew assembleRelease -PreactNativeArchitectures=arm64-v8a --no-daemon
+
+      - name: Align & Sign APK with CipherParadox Keystore (apksigner v2/v3)
+        if: steps.check_release.outputs.should_build == 'true'
+        env:
+          KEYSTORE_B64: ${{ secrets.SIGNING_KEY_STORE_BASE64 }}
+          KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          STORE_PASS: ${{ secrets.SIGNING_STORE_PASSWORD }}
+          KEY_PASS: ${{ secrets.SIGNING_KEY_PASSWORD }}
+        run: |
+          echo "$KEYSTORE_B64" | base64 -d > /tmp/paradox-release.jks
+          RAW_APK=$(find android/app/build/outputs/apk -name "*.apk" | head -n 1)
+          echo "Located raw APK: $RAW_APK"
+
+          BUILD_TOOLS_DIR=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -n 1)
+          "$BUILD_TOOLS_DIR/zipalign" -v -p 4 "$RAW_APK" /tmp/aligned.apk
+          "$BUILD_TOOLS_DIR/apksigner" sign \
+            --ks /tmp/paradox-release.jks \
+            --ks-key-alias "$KEY_ALIAS" \
+            --ks-pass env:STORE_PASS \
+            --key-pass env:KEY_PASS \
+            --v2-signing-enabled true \
+            --v3-signing-enabled true \
+            --out pocketpal-paradox-plus-arm64-v8a-release.apk \
+            /tmp/aligned.apk
+
+          "$BUILD_TOOLS_DIR/apksigner" verify --verbose --print-certs pocketpal-paradox-plus-arm64-v8a-release.apk
+          rm -f /tmp/paradox-release.jks /tmp/aligned.apk
+
+      - name: Publish Signed Release to Fork for Obtainium
+        if: steps.check_release.outputs.should_build == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.check_release.outputs.upstream_tag }}"
+          gh release create "$TAG" pocketpal-paradox-plus-arm64-v8a-release.apk \
+            --repo "${{ github.repository }}" \
+            --title "PocketPal AI $TAG (ParadoxForge Source Build - Plus Unlocked)" \
+            --notes "Automated arm64-v8a build from upstream tag $TAG signed with CipherParadox certificate. Includes all PocketPal Plus features (Hands-Free Voice Mode) natively unlocked."
