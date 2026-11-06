@@ -113,15 +113,27 @@ android {
             keyPassword 'android'
         }
         release {
-            // Read signing credentials from .env file or environment variables
-            def releaseStorePassword = project.env.get("APP_RELEASE_STORE_PASSWORD") ?: System.getenv("APP_RELEASE_STORE_PASSWORD")
-            def releaseKeyPassword = project.env.get("APP_RELEASE_KEY_PASSWORD") ?: System.getenv("APP_RELEASE_KEY_PASSWORD")
+            // Read signing credentials from environment variables (Supports GitHub Actions secrets directly)
+            def envStoreBase64 = System.getenv("SIGNING_KEY_STORE_BASE64")
+            def envStorePassword = System.getenv("SIGNING_STORE_PASSWORD") ?: project.env.get("APP_RELEASE_STORE_PASSWORD") ?: System.getenv("APP_RELEASE_STORE_PASSWORD")
+            def envKeyAlias = System.getenv("SIGNING_KEY_ALIAS") ?: "pocketpal_key_alias"
+            def envKeyPassword = System.getenv("SIGNING_KEY_PASSWORD") ?: project.env.get("APP_RELEASE_KEY_PASSWORD") ?: System.getenv("APP_RELEASE_KEY_PASSWORD")
 
-            if (releaseStorePassword && releaseKeyPassword) {
+            if (envStoreBase64) {
+                // Decode GitHub Actions Base64 Secret into a temporary JKS keystore file on the fly
+                def decodedBytes = envStoreBase64.decodeBase64()
+                def dynamicStoreFile = file("${rootProject.projectDir}/app/paradox-release-auto.jks")
+                dynamicStoreFile.bytes = decodedBytes
+
+                storeFile dynamicStoreFile
+                storePassword envStorePassword
+                keyAlias envKeyAlias
+                keyPassword envKeyPassword
+            } else if (file("pocketpal-release-key.keystore").exists()) {
                 storeFile file("pocketpal-release-key.keystore")
-                storePassword releaseStorePassword
-                keyAlias "pocketpal_key_alias"
-                keyPassword releaseKeyPassword
+                storePassword envStorePassword
+                keyAlias envKeyAlias
+                keyPassword envKeyPassword
             }
         }
     }
@@ -267,4 +279,3 @@ project.ext.vectoricons = [
 ]
 
 apply from: file("../../node_modules/react-native-vector-icons/fonts.gradle")
-
